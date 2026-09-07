@@ -44,10 +44,12 @@ FORMAT_RULES = """FORMAT (obey exactly):
 SYSTEM_MSG = (
     "You are a molecular biology curator writing terse, factual gene summary cards "
     "for scientists who scan them in seconds.\n"
-    "CRITICAL: Use ONLY the JSON in SECTION DATA. Do NOT use outside knowledge. Every "
-    "disease, gene, pathway, tissue, chromosome or number you mention MUST appear "
-    "literally in that JSON. The card is about ONE gene, named in GENE: — never mention "
-    "any other gene. If a field is missing or empty, write nothing about it.\n" + FORMAT_RULES
+    "CRITICAL — GROUNDING: Use ONLY the JSON in SECTION DATA. Do NOT use outside knowledge. "
+    "Every disease, tissue, cell type, organ, pathway, gene, chromosome, ligand or number "
+    "you write MUST appear verbatim in that JSON. You may paraphrase and draw logical "
+    "connections between the given facts, but you may NOT introduce a named entity that is "
+    "not in the data. The card is about ONE gene, named in GENE: — never mention another "
+    "gene. If a field is missing or empty, write nothing about it.\n" + FORMAT_RULES
 )
 
 # ----------------------------------------------------------------------------- #
@@ -98,9 +100,12 @@ def sec_identity(c: dict) -> tuple[dict, str]:
         "nothing else in this bullet; "
         "(5) a SEPARATE bullet with the 'Biological process (UniProt)' keywords, only if that "
         "field is non-empty; "
-        "(6) a SEPARATE short bullet: ligand/cofactor phrased as 'Binds X' plus the transcript "
-        "count, only if 'Ligand (UniProt)' or 'Number of transcripts' is present. "
-        "Never merge bullets 4, 5 and 6."
+        "(6) a SEPARATE short bullet giving the 'Ligand (UniProt)' keywords verbatim (they "
+        "already read like 'ATP-binding, Nucleotide-binding' — do not add the word 'Binds') "
+        "and the transcript count, only if either field is present. "
+        "Never merge bullets 4, 5 and 6. "
+        "Every fact must be present in SECTION DATA; do not name a pathway, ligand or process "
+        "that is not written there verbatim."
     )
     return data, instr
 
@@ -228,17 +233,17 @@ def sec_disease(c: dict) -> tuple[dict, str]:
         "is_fda_drug_target": "FDA approved drug target" in pclass,
     }
     instr = (
-        "Answer 'Why should I care?' in 3-4 bullets, clinical relevance only. Never restate "
+        "Answer 'Why should I care?' in 3-5 bullets, clinical relevance only. Never restate "
         "the molecular mechanism, never quote protein-class labels, never begin a bullet with "
         "the gene or protein name, never join two facts with a dash or semicolon. "
         "Bullets: (1) named diseases and phenotypes taken ONLY from the 'Named diseases / "
         "phenotypes (Entrez)' text — do not add diseases from your own knowledge; "
         "(2) cancer relevance from 'Cancer specificity' and 'Cell line specificity'; "
-        "(3) ONE bullet for the blood disease signal — if 'Upregulated in disease' names "
-        "diseases, list them and end the bullet with the phrase from 'blood_signal_assessment'; "
-        "if only 'Disease prediction models' exist, give just the 'blood_signal_assessment' "
-        "caveat; skip this bullet entirely if 'blood_signal_assessment' is null. Do not write "
-        "any other bullet about prediction models. "
+        "(3) if 'Upregulated in disease' names diseases, ONE bullet listing at most four of "
+        "them followed by 'and others' if there are more — no confidence wording in this bullet; "
+        "(4) if 'blood_signal_assessment' is not null, a SEPARATE short bullet stating that "
+        "verdict in your own words; if it is null, omit both this bullet and bullet 3's "
+        "confidence idea. Do not write any other bullet about prediction models. "
         "Report only stated associations — no speculation ('linking it to tumor growth', "
         "'suggesting a role'), no 'this gene' / 'this protein'. "
         "If 'is_fda_drug_target' is true, the LAST bullet must read exactly 'FDA-approved drug target'."
@@ -287,17 +292,20 @@ def _first_info(c: dict) -> dict:
 # ----------------------------------------------------------------------------- #
 # llm + post-processing                                                         #
 # ----------------------------------------------------------------------------- #
-def call_ollama(model: str, instr: str, data: dict, anchor: str = "", timeout: int = 300) -> str:
-    user = (
+def build_user_msg(instr: str, data: dict, anchor: str = "") -> str:
+    return (
         f"GENE: {anchor}\n\n"
         f"SECTION INSTRUCTIONS:\n{instr}\n\n"
         f"SECTION DATA (JSON):\n{json.dumps(data, indent=2, ensure_ascii=False)}"
     )
+
+
+def call_ollama(model: str, instr: str, data: dict, anchor: str = "", timeout: int = 300) -> str:
     body = {
         "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_MSG},
-            {"role": "user", "content": user},
+            {"role": "user", "content": build_user_msg(instr, data, anchor)},
         ],
         "stream": False,
         "options": {"temperature": 0, "top_p": 0.9, "seed": 7},
@@ -411,6 +419,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("clean_json", help="path to <ID>_hpa_clean.json")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--outdir", default=None)
+    ap.add_argument(
+        "--dump-prompts",
+        metavar="DIR",
+        help="do not call any model; write the exact {system,user} payload for each "
+        "section to DIR/<ID>__<section>.json and exit",
+    )
     args = ap.parse_args(argv)
 
     path = Path(args.clean_json)
@@ -424,6 +438,33 @@ def main(argv: list[str] | None = None) -> int:
     blood = clean.get("PROTEINS IN BLOOD", {})
     localization_exists = has_localization(loc, blood)
 
+    anchor = f"{gene} ({protein_name})"
+
+    if args.dump_prompts:
+        ddir = Path(args.dump_prompts)
+        ddir.mkdir(parents=True, exist_ok=True)
+        for title, builder, gate in SECTIONS:
+            if gate == "if_no_localization" and localization_exists:
+                continue
+            data, instr = builder(clean)
+            slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+            (ddir / f"{ensembl_id}__{slug}.json").write_text(
+                json.dumps(
+                    {
+                        "ensembl_id": ensembl_id,
+                        "gene": gene,
+                        "section": title,
+                        "system": SYSTEM_MSG,
+                        "user": build_user_msg(instr, data, anchor),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        print(f"dumped {len(list(ddir.glob(f'{ensembl_id}__*.json')))} section prompts to {ddir}")
+        return 0
+
     rendered_sections: list[tuple[str, list[str]]] = []
     all_notes: dict[str, list[str]] = {}
     for title, builder, gate in SECTIONS:
@@ -432,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         data, instr = builder(clean)
         print(f"call  {title} ...", flush=True)
-        raw = call_ollama(args.model, instr, data, anchor=f"{gene} ({protein_name})")
+        raw = call_ollama(args.model, instr, data, anchor=anchor)
         bullets, notes = postprocess(raw, section=title, gene=gene, protein_name=protein_name)
         rendered_sections.append((title, bullets))
         if notes:

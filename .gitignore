@@ -1,3 +1,6 @@
 output/
 data/
+raw_sonnet/
 scripts/__pycache__/
+
+.DS_Store
