@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """Turn a cleaned HPA gene JSON (<ID>_hpa_clean.json) into a structured bullet summary.
 
-Uses a local Ollama model (default: gpt-oss:20b). One LLM call per section, each
-given only the slice of the JSON it needs plus tailored instructions. Section
-inclusion and the RNA-vs-protein split are decided by rules here, not the model.
+Uses Gemini (via Vertex AI, see scripts/docs/setup_gemini_vertex_ai.md; default model:
+gemini-3.8-flash). One LLM call per section, each given only the slice of the JSON it
+needs plus tailored instructions. Section inclusion and the RNA-vs-protein split are
+decided by rules here, not the model.
 
-Sections
-  1. IDENTITY & FUNCTION          (always)
-  2. EXPRESSION                   (always; protein view only if MS/DVP data exists)
-  3. PROTEIN LOCALIZATION         (always)
-  4. DISEASE & CLINICAL RELEVANCE (always)
-  5. PROTEIN & MOLECULAR CONTEXT  (only when no subcellular AND no secretome data)
+Sections (each skipped if its input data is empty)
+  1. IDENTITY & FUNCTION          (protein interactions folded in here)
+  2. EXPRESSION                   (protein view only if MS/DVP data exists)
+  3. PROTEIN LOCALIZATION
+  4. DISEASE & CLINICAL RELEVANCE
 
 Usage
   python scripts/summarize_gene.py output/ENSG00000146648_hpa_clean.json
-  python scripts/summarize_gene.py output/ENSG00000146648_hpa_clean.json --model gpt-oss:20b
+  python scripts/summarize_gene.py output/ENSG00000146648_hpa_clean.json --model gemini-3.8-flash
 """
 from __future__ import annotations
 
@@ -22,11 +22,23 @@ import argparse
 import json
 import re
 import sys
-import urllib.request
 from pathlib import Path
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-DEFAULT_MODEL = "gpt-oss:20b"
+from google import genai
+from google.genai import types
+
+VERTEX_PROJECT = "scilifelab-hpa-proj-1"
+VERTEX_LOCATION = "global"  # regional locations 404 on these models
+DEFAULT_MODEL = "gemini-3.8-flash"
+
+_client: genai.Client | None = None
+
+
+def get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        _client = genai.Client(vertexai=True, project=VERTEX_PROJECT, location=VERTEX_LOCATION)
+    return _client
 
 # ----------------------------------------------------------------------------- #
 # formatting contract (also enforced programmatically in postprocess/validate)  #
@@ -49,7 +61,9 @@ SYSTEM_MSG = (
     "you write MUST appear verbatim in that JSON. You may paraphrase and draw logical "
     "connections between the given facts, but you may NOT introduce a named entity that is "
     "not in the data. The card is about ONE gene, named in GENE: — never mention another "
-    "gene. If a field is missing or empty, write nothing about it.\n" + FORMAT_RULES
+    "gene. If a field is missing, empty, or reads 'Not detected'/'Not available'/similar, "
+    "omit it completely — never write a bullet stating that data is absent, not detected, "
+    "not available, or unknown; simply leave that fact out.\n" + FORMAT_RULES
 )
 
 # ----------------------------------------------------------------------------- #
@@ -66,12 +80,6 @@ def has_protein_expression(loc: dict) -> bool:
     return _real(loc.get("Tissue specificity (MS)")) or _real(loc.get("Cell type specificity (DVP)"))
 
 
-def has_localization(loc: dict, blood: dict) -> bool:
-    return _real(loc.get("Subcellular location")) or _real(loc.get("Extracellular location")) or _real(
-        blood.get("Secretome annotation")
-    )
-
-
 # ----------------------------------------------------------------------------- #
 # section specs: (title, builder -> (data_dict, extra_instructions) or None)     #
 # ----------------------------------------------------------------------------- #
@@ -82,6 +90,7 @@ def sec_identity(c: dict) -> tuple[dict, str]:
         "name": {k: info.get(k) for k in ("Protein", "Gene name")},
         "Protein class": info.get("Protein class"),
         "Number of transcripts": info.get("Number of transcripts"),
+        "Protein interactions": info.get("Protein interactions"),
         "Protein function (UniProt)": fn.get("Protein function (UniProt)"),
         "Gene summary (Entrez)": fn.get("Gene summary (Entrez)"),
         "Molecular function (UniProt)": fn.get("Molecular function (UniProt)"),
@@ -89,21 +98,28 @@ def sec_identity(c: dict) -> tuple[dict, str]:
         "Ligand (UniProt)": fn.get("Ligand (UniProt)"),
     }
     instr = (
-        "Answer 'What is this gene/protein?' in 4-5 short bullets: "
+        "Answer 'What is this gene/protein?'. Each numbered item below is a SEPARATE bullet, "
+        "included ONLY if its source field(s) are present in SECTION DATA — never write a "
+        "bullet for a field that is missing, empty, or 'Not available', and never write a "
+        "bullet saying data is missing: "
         "(1) protein full name followed by the gene symbol in parentheses, no synonyms "
-        "(e.g. 'Insulin (INS)'); "
+        "(e.g. 'Insulin (INS)'), from 'name'; always includible since gene/protein identity "
+        "is always present; "
         "(2) one phrase generalising 'Protein class' into a category (e.g. 'druggable "
         "receptor tyrosine kinase, cancer- and disease-associated'); do not list every class; "
+        "only if 'Protein class' is present; "
         "(3) one compact functional description from 'Protein function (UniProt)' + "
-        "'Gene summary (Entrez)'; "
+        "'Gene summary (Entrez)'; only if at least one of those is present; "
         "(4) the 'Molecular function (UniProt)' keywords, verbatim as a comma-separated list, "
-        "nothing else in this bullet; "
-        "(5) a SEPARATE bullet with the 'Biological process (UniProt)' keywords, only if that "
-        "field is non-empty; "
-        "(6) a SEPARATE short bullet giving the 'Ligand (UniProt)' keywords verbatim (they "
-        "already read like 'ATP-binding, Nucleotide-binding' — do not add the word 'Binds') "
-        "and the transcript count, only if either field is present. "
-        "Never merge bullets 4, 5 and 6. "
+        "nothing else in this bullet; only if present; "
+        "(5) the 'Biological process (UniProt)' keywords, only if that field is non-empty; "
+        "(6) the 'Ligand (UniProt)' keywords verbatim (they already read like 'ATP-binding, "
+        "Nucleotide-binding' — do not add the word 'Binds') and the transcript count, only if "
+        "either field is present; "
+        "(7) the 'Protein interactions' count/content, only if that field is present and does "
+        "not itself say there are no interactions — if it says there are no interactions, omit "
+        "this bullet entirely. "
+        "Never merge two of these bullets into one. "
         "Every fact must be present in SECTION DATA; do not name a pathway, ligand or process "
         "that is not written there verbatim."
     )
@@ -117,15 +133,19 @@ def sec_expression(c: dict) -> tuple[dict, str]:
     info = _first_info(c)
     protein_view = has_protein_expression(loc)
     data = {
-        "RNA tissue specificity": tissue.get("Tissue specificity"),
-        "RNA single-cell type specificity": celltype.get("Single cell type specificity"),
-        "Tissue cell type classification": celltype.get("Tissue cell type classification"),
+        "RNA tissue specificity (bulk RNA)": tissue.get("Tissue specificity"),
+        "RNA single-cell type specificity (single-cell RNA pseudobulk to celltypes)": celltype.get(
+            "Single cell type specificity"
+        ),
         "Brain specificity": tissue.get("Brain specificity"),
         "Protein level (MS / DVP)": (
             {
-                "Tissue profile": loc.get("Tissue profile"),
-                "Tissue specificity (MS)": loc.get("Tissue specificity (MS)"),
-                "Cell type specificity (DVP)": loc.get("Cell type specificity (DVP)"),
+                "Tissue profile (human annotation of IHC images)": loc.get("Tissue profile"),
+                "Tissue specificity (MS) (bulk tissue mass spectrometry data)": loc.get(
+                    "Tissue specificity (MS)"
+                ),
+                "Cell type specificity (DVP) (deep visual proteomics, MS data but single "
+                "celltype group)": loc.get("Cell type specificity (DVP)"),
             }
             if protein_view
             else None
@@ -146,8 +166,6 @@ def sec_expression(c: dict) -> tuple[dict, str]:
         )
         + "Numbers were given ONLY so you can tell strong from weak expression — describe it "
         "as 'high', 'low' or 'barely detected' and NEVER write a number, unit, nTPM or nCPM. "
-        "'Tissue cell type classification' is the same single-cell data scored per tissue, "
-        "not globally — frame it that way. "
         "Next bullet, ONLY if 'Brain specificity' is present: reproduce it closely. "
         "Last bullet: copy the 'Protein evidence' value verbatim — this is the curation "
         "evidence tier, not an expression statement, and must not contradict the bullets above."
@@ -172,8 +190,8 @@ def sec_localization(c: dict) -> tuple[dict, str]:
             "(1) main subcellular location(s) from 'Subcellular location', keeping the "
             "'(Reliability: ...)' suffix once; "
             if has_sub
-            else "(1) state that there is no experimental subcellular localization data, "
-            "then give the predicted compartment from 'Predicted location'; "
+            else "(1) the predicted compartment from 'Predicted location', stated directly "
+            "as fact — do not mention that experimental data is missing or unavailable; "
         )
         + "(2) whether it is secreted, membrane-bound and/or intracellular, merging "
         "'Predicted location', 'Extracellular location' and 'Secretome annotation' without "
@@ -251,34 +269,25 @@ def sec_disease(c: dict) -> tuple[dict, str]:
     return data, instr
 
 
-def sec_context(c: dict) -> tuple[dict, str]:
-    info = _first_info(c)
-    fn = c.get("PROTEIN FUNCTION", {})
-    loc = c.get("PROTEIN EXPRESSION AND LOCALIZATION", {})
-    data = {
-        "Number of transcripts": info.get("Number of transcripts"),
-        "Protein interactions": info.get("Protein interactions"),
-        "Predicted location": loc.get("Predicted location"),
-        "Protein function (UniProt)": fn.get("Protein function (UniProt)"),
-        "Molecular function (UniProt)": fn.get("Molecular function (UniProt)"),
-        "Ligand (UniProt)": fn.get("Ligand (UniProt)"),
-    }
-    instr = (
-        "Answer 'How does it fit into biology?'. Bullets: isoform/transcript count and any "
-        "structural note; number of protein interactions; the main pathways or signalling "
-        "cascades named in 'Protein function (UniProt)'; ligand/cofactor information. Show "
-        "only the most informative items; skip anything absent."
-    )
-    return data, instr
-
-
 SECTIONS = [
-    ("IDENTITY & FUNCTION", sec_identity, "always"),
-    ("EXPRESSION", sec_expression, "always"),
-    ("PROTEIN LOCALIZATION", sec_localization, "always"),
-    ("DISEASE & CLINICAL RELEVANCE", sec_disease, "always"),
-    ("PROTEIN & MOLECULAR CONTEXT", sec_context, "if_no_localization"),
+    ("IDENTITY & FUNCTION", sec_identity),
+    ("EXPRESSION", sec_expression),
+    ("PROTEIN LOCALIZATION", sec_localization),
+    ("DISEASE & CLINICAL RELEVANCE", sec_disease),
 ]
+
+
+def has_real_data(value) -> bool:
+    """True if `value` (a section's data dict/list/scalar) contains any real, non-empty value."""
+    if isinstance(value, dict):
+        return any(has_real_data(v) for v in value.values())
+    if isinstance(value, list):
+        return any(has_real_data(v) for v in value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return _real(value)
+    return value is not None
 
 
 def _first_info(c: dict) -> dict:
@@ -300,21 +309,18 @@ def build_user_msg(instr: str, data: dict, anchor: str = "") -> str:
     )
 
 
-def call_ollama(model: str, instr: str, data: dict, anchor: str = "", timeout: int = 300) -> str:
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_MSG},
-            {"role": "user", "content": build_user_msg(instr, data, anchor)},
-        ],
-        "stream": False,
-        "options": {"temperature": 0, "top_p": 0.9, "seed": 7},
-    }
-    req = urllib.request.Request(
-        OLLAMA_URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+def call_gemini(model: str, instr: str, data: dict, anchor: str = "") -> str:
+    resp = get_client().models.generate_content(
+        model=model,
+        contents=build_user_msg(instr, data, anchor),
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_MSG,
+            temperature=0,
+            top_p=0.9,
+            seed=7,
+        ),
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())["message"]["content"]
+    return resp.text or ""
 
 
 BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.*\S)\s*$")
@@ -404,8 +410,16 @@ def postprocess(
     return deduped, notes
 
 
-def render(gene: str, ensembl_id: str, sections: list[tuple[str, list[str]]]) -> str:
-    out = [f"# {gene} — gene summary", f"_Ensembl {ensembl_id} · source: Human Protein Atlas_", ""]
+def render(
+    gene: str, ensembl_id: str, sections: list[tuple[str, list[str]]], protein_name: str = ""
+) -> str:
+    title_line = f"# {protein_name} ({gene})" if protein_name else f"# {gene}"
+    if sections and sections[0][1]:
+        first_title, first_bullets = sections[0]
+        title_line = f"# {first_bullets[0]}"
+        remaining = first_bullets[1:]
+        sections = ([(first_title, remaining)] if remaining else []) + sections[1:]
+    out = [title_line, ""]
     for title, bullets in sections:
         out.append(f"## {title.upper()}")
         out.extend(f"- {b}" for b in bullets)
@@ -434,19 +448,15 @@ def main(argv: list[str] | None = None) -> int:
     gene = (info.get("Gene name") or ensembl_id).split(" ")[0]
     protein_name = info.get("Protein") or ""
 
-    loc = clean.get("PROTEIN EXPRESSION AND LOCALIZATION", {})
-    blood = clean.get("PROTEINS IN BLOOD", {})
-    localization_exists = has_localization(loc, blood)
-
     anchor = f"{gene} ({protein_name})"
 
     if args.dump_prompts:
         ddir = Path(args.dump_prompts)
         ddir.mkdir(parents=True, exist_ok=True)
-        for title, builder, gate in SECTIONS:
-            if gate == "if_no_localization" and localization_exists:
-                continue
+        for title, builder in SECTIONS:
             data, instr = builder(clean)
+            if not has_real_data(data):
+                continue
             slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
             (ddir / f"{ensembl_id}__{slug}.json").write_text(
                 json.dumps(
@@ -467,19 +477,22 @@ def main(argv: list[str] | None = None) -> int:
 
     rendered_sections: list[tuple[str, list[str]]] = []
     all_notes: dict[str, list[str]] = {}
-    for title, builder, gate in SECTIONS:
-        if gate == "if_no_localization" and localization_exists:
-            print(f"skip  {title}  (localization data present)")
-            continue
+    for title, builder in SECTIONS:
         data, instr = builder(clean)
+        if not has_real_data(data):
+            print(f"skip  {title}  (no data in input)")
+            continue
         print(f"call  {title} ...", flush=True)
-        raw = call_ollama(args.model, instr, data, anchor=anchor)
+        raw = call_gemini(args.model, instr, data, anchor=anchor)
         bullets, notes = postprocess(raw, section=title, gene=gene, protein_name=protein_name)
+        if bullets == ["No data available"]:
+            print(f"skip  {title}  (model returned no usable content)")
+            continue
         rendered_sections.append((title, bullets))
         if notes:
             all_notes[title] = notes
 
-    md = render(gene, ensembl_id, rendered_sections)
+    md = render(gene, ensembl_id, rendered_sections, protein_name=protein_name)
     outdir = Path(args.outdir) if args.outdir else path.parent
     outdir.mkdir(parents=True, exist_ok=True)
     md_path = outdir / f"{ensembl_id}_summary.md"
