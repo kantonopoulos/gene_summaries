@@ -1,6 +1,8 @@
 output/
 data/
-raw_sonnet/
 scripts/__pycache__/
+*.json.key
+*-key.json
+credentials*.json
 
 .DS_Store
