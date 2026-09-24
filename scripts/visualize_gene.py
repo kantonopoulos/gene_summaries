@@ -3,8 +3,9 @@
 
 Uses Gemini 3 Pro Image ("Nano Banana Pro") via Vertex AI (see
 scripts/docs/setup_gemini_vertex_ai.md). The full summary Markdown is handed to the
-model together with a fixed style-guide prompt; the model draws a 4:3 infographic
-from it directly (no layout logic here — that's the model's job).
+model together with a fixed style-guide prompt; the model draws a 16:9 infographic
+from it directly (no layout logic here — that's the model's job). One shot, no
+validation or retry — whatever the model returns is kept.
 
 Usage
   python scripts/visualize_gene.py output/ENSG00000254647_summary.md
@@ -23,6 +24,7 @@ from google.genai import types
 VERTEX_PROJECT = "scilifelab-hpa-proj-1"
 VERTEX_LOCATION = "global"  # regional locations 404 on these models
 DEFAULT_MODEL = "gemini-3-pro-image"
+ASPECT_RATIO = "16:9"
 
 _client: genai.Client | None = None
 
@@ -54,16 +56,16 @@ STYLE_GUIDE = """STYLE GUIDE (obey exactly):
   naturally alongside vector illustrations using clean badge tags and callout lines rather
   than blocky text boxes."""
 
-NEGATIVE_CONSTRAINTS = """HARD CONSTRAINTS (do not violate):
+NEGATIVE_CONSTRAINTS = """HARD CONSTRAINTS (do not violate; the first two are the most important):
+- No duplicated information: each fact and section label appears exactly once in the image —
+  never repeat the same fact, callout, or icon in two places.
+- No misspelled or garbled text: every rendered word must be spelled correctly.
 - No chemical structure diagrams of any kind (no skeletal/hexagon sugar-ring formulas, no
   amino acid chains, no protein ribbon diagrams or crystal-structure renderings).
 - No charts, graphs, bar plots, line plots, or any data-visualization widgets.
 - No literal markdown or typographic marker characters anywhere in the image: never draw
   '#', '##', '-', '*', or similar symbols as glyphs — text is rendered as clean typography
-  only.
-- No duplicated information: each FACT line from the summary is illustrated, labelled, or
-  connected exactly ONCE in the whole image — never repeat the same fact, callout, or icon
-  in two different places, even reworded or attached to a different node."""
+  only."""
 
 
 def strip_markdown(summary_md: str) -> str:
@@ -85,7 +87,7 @@ def strip_markdown(summary_md: str) -> str:
 def build_prompt(summary_md: str) -> str:
     structured = strip_markdown(summary_md)
     return (
-        "Create a single infographic image (4:3 aspect ratio) summarizing this gene, "
+        f"Create a single infographic image ({ASPECT_RATIO} aspect ratio) summarizing this gene, "
         "using ONLY the facts below. Do not invent facts not present here. The labels "
         "below (TITLE, SECTION LABEL, FACT) describe each line's ROLE only — render its "
         "content as clean designed typography, never the label word itself. Give every "
@@ -103,7 +105,7 @@ def call_gemini_image(model: str, prompt: str) -> bytes:
         contents=prompt,
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE", "TEXT"],
-            image_config=types.ImageConfig(aspect_ratio="4:3"),
+            image_config=types.ImageConfig(aspect_ratio=ASPECT_RATIO),
         ),
     )
     for part in resp.candidates[0].content.parts:
