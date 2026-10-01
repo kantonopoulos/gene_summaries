@@ -25,6 +25,9 @@ VERTEX_PROJECT = "scilifelab-hpa-proj-1"
 VERTEX_LOCATION = "global"  # regional locations 404 on these models
 DEFAULT_MODEL = "gemini-3-pro-image"
 ASPECT_RATIO = "16:9"
+# JPEG q90: ~0.28 MB vs ~1.5 MB PNG per infographic, text stays sharp
+OUTPUT_MIME = "image/jpeg"
+JPEG_QUALITY = 90
 
 _client: genai.Client | None = None
 
@@ -48,18 +51,21 @@ STYLE_GUIDE = """STYLE GUIDE (obey exactly):
 - Organic Scaling: Integrate multi-scale illustrations directly into the artwork—seamlessly
   zooming from organ scale to cell type down to subcellular scale (e.g. organelles, vesicles,
   receptors as simple stylized icons — not literal molecular diagrams).
-- Adaptive Color Palette: Match colors to the gene's primary biological context (e.g., deep
-  navy, cyan, and slate gray for intracellular/ribosomal proteins; crimson/amber for
-  blood/liver; soft blues/teal for endocrine). Use a clean off-white background (hex F8F9FA)
-  with subtle glows and drop shadows.
+- Adaptive Color Palette: Pick hues that capture the feeling of THIS protein's own role, drawn
+  from the full spectrum, not just red or blue — e.g. violet/gold for immune, green/amber for
+  metabolic, indigo/lilac for neural, teal/coral for sensory, slate/cyan for structural. Let
+  the specific biology decide, never a generic default.
 - Typography & Details: High-contrast sans-serif font. Keep text brief and integrated
   naturally alongside vector illustrations using clean badge tags and callout lines rather
   than blocky text boxes."""
 
-NEGATIVE_CONSTRAINTS = """HARD CONSTRAINTS (do not violate; the first two are the most important):
+NEGATIVE_CONSTRAINTS = """HARD CONSTRAINTS (do not violate; the first three are the most important):
 - No duplicated information: each fact and section label appears exactly once in the image —
-  never repeat the same fact, callout, or icon in two places.
+  never repeat the same fact, callout, or icon in two places. If a gene has few facts, that is
+  fine — leave the composition sparse rather than padding it with repeats.
 - No misspelled or garbled text: every rendered word must be spelled correctly.
+- The page background is ALWAYS a clean off-white (hex F8F9FA), with subtle glows/shadows on
+  top of it — never a colored, dark, or full-bleed background of any other color.
 - No chemical structure diagrams of any kind (no skeletal/hexagon sugar-ring formulas, no
   amino acid chains, no protein ribbon diagrams or crystal-structure renderings).
 - No charts, graphs, bar plots, line plots, or any data-visualization widgets.
@@ -105,13 +111,32 @@ def call_gemini_image(model: str, prompt: str) -> bytes:
         contents=prompt,
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE", "TEXT"],
-            image_config=types.ImageConfig(aspect_ratio=ASPECT_RATIO),
+            image_config=types.ImageConfig(
+                aspect_ratio=ASPECT_RATIO,
+                output_mime_type=OUTPUT_MIME,
+                output_compression_quality=JPEG_QUALITY,
+            ),
         ),
     )
     for part in resp.candidates[0].content.parts:
         if part.inline_data:
             return part.inline_data.data
     raise RuntimeError("model returned no image")
+
+
+def batch_request_image(prompt: str) -> dict:
+    """The same call as call_gemini_image, as a Vertex batch GenerateContentRequest
+    (REST/camelCase). Keep the two in sync."""
+    return {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE", "TEXT"],
+            "imageConfig": {
+                "aspectRatio": ASPECT_RATIO,
+                "imageOutputOptions": {"mimeType": OUTPUT_MIME, "compressionQuality": JPEG_QUALITY},
+            },
+        },
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -131,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
 
     outdir = Path(args.outdir) if args.outdir else path.parent
     outdir.mkdir(parents=True, exist_ok=True)
-    out_path = outdir / f"{ensembl_id}_visual.png"
+    out_path = outdir / f"{ensembl_id}_visual.jpg"
     out_path.write_bytes(image_bytes)
     print(f"wrote {out_path}  ({out_path.stat().st_size:,} bytes)")
     return 0

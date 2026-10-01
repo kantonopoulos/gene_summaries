@@ -30,6 +30,10 @@ from google.genai import types
 VERTEX_PROJECT = "scilifelab-hpa-proj-1"
 VERTEX_LOCATION = "global"  # regional locations 404 on these models
 DEFAULT_MODEL = "gemini-3.8-flash"
+# model-side reasoning; on the 20-gene pilot "low" used ~6 thought tokens/call vs ~1.6k for
+# "default", with the same facts but noticeably looser wording and formatting
+DEFAULT_THINKING = "default"
+THINKING_LEVELS = ("default", "minimal", "low", "medium", "high")
 
 _client: genai.Client | None = None
 
@@ -309,7 +313,10 @@ def build_user_msg(instr: str, data: dict, anchor: str = "") -> str:
     )
 
 
-def call_gemini(model: str, instr: str, data: dict, anchor: str = "") -> str:
+def call_gemini(
+    model: str, instr: str, data: dict, anchor: str = "", thinking: str = DEFAULT_THINKING
+) -> tuple[str, dict]:
+    """Returns (text, token usage)."""
     resp = get_client().models.generate_content(
         model=model,
         contents=build_user_msg(instr, data, anchor),
@@ -318,9 +325,32 @@ def call_gemini(model: str, instr: str, data: dict, anchor: str = "") -> str:
             temperature=0,
             top_p=0.9,
             seed=7,
+            thinking_config=(
+                None if thinking == "default"
+                else types.ThinkingConfig(thinking_level=thinking.upper())
+            ),
         ),
     )
-    return resp.text or ""
+    u = resp.usage_metadata
+    usage = {
+        "prompt": u.prompt_token_count or 0,
+        "thoughts": u.thoughts_token_count or 0,
+        "output": u.candidates_token_count or 0,
+    } if u else {}
+    return resp.text or "", usage
+
+
+def batch_request(instr: str, data: dict, anchor: str = "", thinking: str = DEFAULT_THINKING) -> dict:
+    """The same call as call_gemini, as a Vertex batch GenerateContentRequest (REST/camelCase).
+    Keep the two in sync."""
+    gen = {"temperature": 0, "topP": 0.9, "seed": 7}
+    if thinking != "default":
+        gen["thinkingConfig"] = {"thinkingLevel": thinking.upper()}
+    return {
+        "contents": [{"role": "user", "parts": [{"text": build_user_msg(instr, data, anchor)}]}],
+        "systemInstruction": {"parts": [{"text": SYSTEM_MSG}]},
+        "generationConfig": gen,
+    }
 
 
 BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.*\S)\s*$")
@@ -428,10 +458,41 @@ def render(
 
 
 # ----------------------------------------------------------------------------- #
+def write_summary(
+    outdir: Path, ensembl_id: str, gene: str, protein_name: str,
+    sections: list[tuple[str, list[str]]], notes: dict[str, list[str]], meta: dict,
+) -> tuple[str, Path, Path]:
+    """Write <ID>_summary.md and <ID>_summary.json; `meta` = model / thinking / usage."""
+    md = render(gene, ensembl_id, sections, protein_name=protein_name)
+    outdir.mkdir(parents=True, exist_ok=True)
+    md_path = outdir / f"{ensembl_id}_summary.md"
+    md_path.write_text(md, encoding="utf-8")
+    json_path = outdir / f"{ensembl_id}_summary.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "ensembl_id": ensembl_id,
+                "gene": gene,
+                "model": meta.get("model"),
+                "thinking": meta.get("thinking"),
+                "sections": [{"title": t, "bullets": b} for t, b in sections],
+                "format_notes": notes,
+                "usage": meta.get("usage", {}),
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return md, md_path, json_path
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("clean_json", help="path to <ID>_hpa_clean.json")
     ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--thinking", default=DEFAULT_THINKING, choices=THINKING_LEVELS,
+                    help="model thinking level ('default' = let the model decide)")
     ap.add_argument("--outdir", default=None)
     ap.add_argument(
         "--dump-prompts",
@@ -477,13 +538,14 @@ def main(argv: list[str] | None = None) -> int:
 
     rendered_sections: list[tuple[str, list[str]]] = []
     all_notes: dict[str, list[str]] = {}
+    usage: dict[str, dict] = {}
     for title, builder in SECTIONS:
         data, instr = builder(clean)
         if not has_real_data(data):
             print(f"skip  {title}  (no data in input)")
             continue
         print(f"call  {title} ...", flush=True)
-        raw = call_gemini(args.model, instr, data, anchor=anchor)
+        raw, usage[title] = call_gemini(args.model, instr, data, anchor=anchor, thinking=args.thinking)
         bullets, notes = postprocess(raw, section=title, gene=gene, protein_name=protein_name)
         if bullets == ["No data available"]:
             print(f"skip  {title}  (model returned no usable content)")
@@ -492,25 +554,10 @@ def main(argv: list[str] | None = None) -> int:
         if notes:
             all_notes[title] = notes
 
-    md = render(gene, ensembl_id, rendered_sections, protein_name=protein_name)
     outdir = Path(args.outdir) if args.outdir else path.parent
-    outdir.mkdir(parents=True, exist_ok=True)
-    md_path = outdir / f"{ensembl_id}_summary.md"
-    md_path.write_text(md, encoding="utf-8")
-    json_path = outdir / f"{ensembl_id}_summary.json"
-    json_path.write_text(
-        json.dumps(
-            {
-                "ensembl_id": ensembl_id,
-                "gene": gene,
-                "model": args.model,
-                "sections": [{"title": t, "bullets": b} for t, b in rendered_sections],
-                "format_notes": all_notes,
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    md, md_path, json_path = write_summary(
+        outdir, ensembl_id, gene, protein_name, rendered_sections, all_notes,
+        {"model": args.model, "thinking": args.thinking, "usage": usage},
     )
 
     print(f"\nwrote {md_path}")
